@@ -1,0 +1,34 @@
+services:
+  xsync-server:
+    image: ${XSYNC_IMAGE:-xsync-server:local}
+    build:
+      context: .
+      args:
+        VERSION: ${XSYNC_VERSION:-dev}
+        COMMIT: ${XSYNC_COMMIT:-unknown}
+        BUILD_DATE: ${XSYNC_BUILD_DATE:-unknown}
+    restart: unless-stopped
+    user: "${XSYNC_UID:-65532}:${XSYNC_GID:-65532}"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - type: bind
+        source: ${XSYNC_CONFIG_DIR:?set XSYNC_CONFIG_DIR to a persistent host directory}
+        target: /etc/xsync
+      - type: bind
+        source: ${XSYNC_DATA_DIR:?set XSYNC_DATA_DIR to the mounted data disk}
+        target: /data
+    ports:
+      - "${XSYNC_SFTP_PORT:-2022}:2022"
+      - "${XSYNC_FTP_PORT:-2121}:2121"
+      - "${XSYNC_FTP_PASSIVE_START:-30000}-${XSYNC_FTP_PASSIVE_END:-30100}:30000-30100"
+      - "${XSYNC_S3_PORT:-9000}:9000"
+      - "${XSYNC_API_PORT:-9443}:9443"
+    stop_grace_period: 45s
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576

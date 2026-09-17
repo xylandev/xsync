@@ -1,0 +1,7 @@
+/xsync-server
+/.env
+/config/
+/data/
+/dist/
+*.test
+*.prof

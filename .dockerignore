@@ -1,0 +1,8 @@
+.git
+.gitignore
+config
+data
+dist
+xsync-server
+*.test
+*.prof
