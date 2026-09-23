@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/xylandev/xsync/internal/model"
+	bolt "go.etcd.io/bbolt"
 )
 
 func put(t *testing.T, s *Store, tenant, name, body string) *UploadHandle {
@@ -24,7 +28,7 @@ func put(t *testing.T, s *Store, tenant, name, body string) *UploadHandle {
 }
 
 func TestVersionSnapshotAndConditionalDelete(t *testing.T) {
-	s, err := Open(t.TempDir(), nil)
+	s, err := Open(t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,8 +74,69 @@ func TestVersionSnapshotAndConditionalDelete(t *testing.T) {
 	}
 }
 
+// A torn crash plus an unreadable blob must not keep the service from starting.
+func TestRecoverParksUnrecoverableUploadAndStillOpens(t *testing.T) {
+	root := t.TempDir()
+	s, err := Open(root, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	lost := model.Upload{
+		ID: "0123456789abcdef", Tenant: "t", Path: "lost.bin", Protocol: "test",
+		StagingPath: filepath.Join(root, "staging", "t", "0123456789abcdef.partial"),
+		State:       model.StateFinalizing, CreatedAt: now, UpdatedAt: now,
+	}
+	if err = s.db.Update(func(tx *bolt.Tx) error {
+		return putJSON(tx.Bucket(bUploads), []byte(lost.ID), lost)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	healthy := put(t, s, "t", "healthy.bin", "payload")
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(root, nil, nil)
+	if err != nil {
+		t.Fatalf("store refused to open because one upload was unrecoverable: %v", err)
+	}
+	defer s2.Close()
+
+	var got model.Upload
+	if err = s2.db.View(func(tx *bolt.Tx) error {
+		var e error
+		got, e = getJSON[model.Upload](tx.Bucket(bUploads), []byte(lost.ID))
+		return e
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.StateFailed {
+		t.Fatalf("unrecoverable upload state = %q, want %q", got.State, model.StateFailed)
+	}
+	if got.Error == "" {
+		t.Fatal("failed upload recorded no cause")
+	}
+	if _, err = s2.Object(healthy.ID()); err != nil {
+		t.Fatalf("healthy object lost during recovery: %v", err)
+	}
+
+	// partial_ttl expiry must reclaim FAILED records, not just INTERRUPTED ones.
+	s2.now = func() time.Time { return time.Now().UTC().Add(48 * time.Hour) }
+	if err = s2.maintenancePass(context.Background(), 24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	err = s2.db.View(func(tx *bolt.Tx) error {
+		_, e := getJSON[model.Upload](tx.Bucket(bUploads), []byte(lost.ID))
+		return e
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("failed upload was not reclaimed: %v", err)
+	}
+}
+
 func TestRenameDirectoryRejectsDestinationSubtree(t *testing.T) {
-	s, err := Open(t.TempDir(), nil)
+	s, err := Open(t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +158,7 @@ func TestRenameDirectoryRejectsDestinationSubtree(t *testing.T) {
 }
 
 func TestInterruptedUploadCanResume(t *testing.T) {
-	s, err := Open(t.TempDir(), nil)
+	s, err := Open(t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

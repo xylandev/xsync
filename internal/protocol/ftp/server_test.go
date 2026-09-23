@@ -63,7 +63,7 @@ func tlsFiles(t *testing.T) (string, string) {
 }
 
 func TestFTPProtocolRoundTrip(t *testing.T) {
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := store.Open(t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,7 @@ func TestFTPProtocolRoundTrip(t *testing.T) {
 }
 
 func TestFTPSProtocolRoundTrip(t *testing.T) {
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := store.Open(t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
@@ -275,15 +277,15 @@ func generateTLS(certFile, keyFile, ipText string) error {
 	if ip == nil {
 		return fmt.Errorf("invalid advertise IP: %s", ipText)
 	}
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return err
 	}
 	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serial, _ := rand.Int(rand.Reader, serialLimit)
 	now := time.Now()
-	template := x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "xsync"}, NotBefore: now.Add(-time.Hour), NotAfter: now.AddDate(2, 0, 0), IPAddresses: []net.IP{ip}, KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, IsCA: true, BasicConstraintsValid: true}
-	der, err := x509.CreateCertificate(rand.Reader, &template, &template, pub, priv)
+	template := x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "xsync"}, NotBefore: now.Add(-time.Hour), NotAfter: now.AddDate(2, 0, 0), IPAddresses: []net.IP{ip}, KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, IsCA: true, BasicConstraintsValid: true}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	if err != nil {
 		return err
 	}
@@ -301,14 +303,9 @@ func generateSSHKey(name string) error {
 	if err != nil {
 		return err
 	}
-	signer, err := ssh.NewSignerFromKey(priv)
-	if err != nil {
-		return err
-	}
 	block, err := ssh.MarshalPrivateKey(priv, "")
 	if err != nil {
 		return err
 	}
-	_ = signer
 	return os.WriteFile(name, pem.EncodeToMemory(block), 0o600)
 }

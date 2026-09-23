@@ -530,19 +530,31 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *fsapi.Comple
 		return nil, fsapi.ErrUploadNotFound
 	}
 	tenant, _ := b.tenant(req.Bucket)
-	h, err := b.st.BeginUpload(ctx, tenant, req.Key, "s3-multipart")
+	// Validate the requested parts and budget for the copy before writing
+	// anything: the parts stay on disk while the object is assembled, so
+	// completion transiently needs room for a second copy of the whole object.
+	ordered := make([]fsapi.Part, 0, len(req.Parts))
+	var total int64
+	for _, wanted := range req.Parts {
+		p, ok := m.Parts[wanted.PartNumber]
+		if !ok || !strings.EqualFold(strings.Trim(wanted.ETag, "\""), p.ETag) {
+			return nil, fsapi.ErrInvalidPart
+		}
+		ordered = append(ordered, p)
+		total += p.Size
+	}
+	if !b.st.HasRoomFor(total) {
+		return nil, store.ErrUploadBlocked
+	}
+	// Assembly bytes were already metered when the parts were uploaded, so this
+	// local copy must not be rate limited or counted as ingress again.
+	h, err := b.st.BeginInternalUpload(ctx, tenant, req.Key, "s3-multipart")
 	if err != nil {
 		return nil, err
 	}
 	whole := md5.New()
 	var off int64
-	for _, wanted := range req.Parts {
-		p, ok := m.Parts[wanted.PartNumber]
-		if !ok || !strings.EqualFold(strings.Trim(wanted.ETag, "\""), p.ETag) {
-			h.TransferError(fsapi.ErrInvalidPart)
-			_ = h.Close()
-			return nil, fsapi.ErrInvalidPart
-		}
+	for _, p := range ordered {
 		f, e := os.Open(filepath.Join(b.multipartRoot, req.UploadID, strconv.Itoa(p.PartNumber)+".part"))
 		if e != nil {
 			h.TransferError(e)
@@ -578,7 +590,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *fsapi.Comple
 	if err = h.Close(); err != nil {
 		return nil, err
 	}
-	etag := fmt.Sprintf("%s-%d", hex.EncodeToString(whole.Sum(nil)), len(req.Parts))
+	etag := fmt.Sprintf("%s-%d", hex.EncodeToString(whole.Sum(nil)), len(ordered))
 	_ = b.st.UpdateObject(h.ID(), func(o *model.ObjectVersion) error {
 		o.ETag = etag
 		o.Metadata = metadataMap(m.Metadata)

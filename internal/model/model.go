@@ -10,9 +10,7 @@ const (
 	StateReady         State = "READY"
 	StateLeased        State = "LEASED"
 	StateDeletePending State = "DELETE_PENDING"
-	StateDeleted       State = "DELETED"
 	StateInterrupted   State = "INTERRUPTED"
-	StateCancelled     State = "CANCELLED"
 	StateFailed        State = "FAILED"
 )
 
@@ -68,7 +66,6 @@ type Tombstone struct {
 
 type Entry struct {
 	Path      string    `json:"path"`
-	ObjectID  string    `json:"object_id,omitempty"`
 	Directory bool      `json:"directory"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

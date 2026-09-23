@@ -2,6 +2,8 @@
 
 `xsync-server` 是单机、多租户的文件中转服务。上传方可使用 SFTP、FTP/FTPS 或兼容 S3 的客户端；下载方通过专用 HTTPS API 认领不可变文件版本，校验 SHA-256 后确认删除。
 
+产品定位、架构、状态机、下载 API 与安全模型见 [docs/architecture.md](docs/architecture.md)。
+
 ## Docker 部署
 
 服务端只以 Docker 镜像部署。宿主机 `/etc/xsync` 保存配置、TLS 证书和 SSH host key，`/mnt/xsync` 示例为已经通过 fstab、云盘或存储系统挂载的数据暂存盘。先设置 Compose 环境并把目录交给镜像内的非 root 用户：
@@ -130,13 +132,13 @@ govulncheck ./...
 UPLOADING -> FINALIZING -> READY -> LEASED -> DELETE_PENDING -> DELETED
 ```
 
-崩溃恢复会重新处理 `FINALIZING`、过期租约和 `DELETE_PENDING`。客户端下载采用至少一次投递、幂等确认语义。
+崩溃恢复会重新处理 `FINALIZING`、过期租约和 `DELETE_PENDING`。无法恢复的单条记录（例如 blob 已读不出）会被标为 `FAILED` 并记入日志，不影响服务启动，也不影响其余对象。客户端下载采用至少一次投递、幂等确认语义。
 
 ## 下载 API
 
 所有 `/v1/` 请求使用 `Authorization: Bearer <API Key>`：
 
-- `POST /v1/claims`：认领对象。
+- `POST /v1/claims`：认领对象。可选 `prefix` 按路径段匹配（`data` 命中 `data/…`，不命中 `database.txt`）。
 - `POST /v1/claims/{lease}/renew`：续租。
 - `DELETE /v1/claims/{lease}`：释放任务。
 - `GET /v1/objects/{id}/content`：携带 `X-Xsync-Lease-ID` 下载，支持 HTTP Range。

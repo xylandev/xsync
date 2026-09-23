@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"time"
@@ -301,19 +302,28 @@ func AddTenant(configPath string, tenant Tenant) error {
 	return writeYAML(accountPath, doc)
 }
 
+// compactCompatible reports whether cfg can be written in the short form without
+// losing anything.
+//
+// It rebuilds a config from the defaults plus exactly the fields the compact
+// form can express, and demands an exact match. Comparing field by field would
+// silently discard a user's setting whenever a new field is added and someone
+// forgets to extend this check; rebuilding makes any unrecognised difference
+// fall back to the full format instead.
 func compactCompatible(cfg Config) bool {
-	defaults := Default()
-	return cfg.Download == defaults.Download &&
-		cfg.Metrics == defaults.Metrics &&
-		cfg.SFTP.Enabled == defaults.SFTP.Enabled &&
-		cfg.SFTP.Listen == defaults.SFTP.Listen &&
-		cfg.FTP.Enabled == defaults.FTP.Enabled &&
-		cfg.FTP.Listen == defaults.FTP.Listen &&
-		cfg.FTP.PassiveStart == defaults.FTP.PassiveStart &&
-		cfg.FTP.PassiveEnd == defaults.FTP.PassiveEnd &&
-		cfg.S3 == defaults.S3 &&
-		cfg.Capacity == defaults.Capacity &&
-		cfg.PartialTTL == defaults.PartialTTL
+	rebuilt := Default()
+	rebuilt.DataDir = cfg.DataDir
+	rebuilt.PublicHost = cfg.PublicHost
+	rebuilt.AccountsFile = cfg.AccountsFile
+	rebuilt.RequireMount = cfg.RequireMount
+	rebuilt.TLSCertFile = cfg.TLSCertFile
+	rebuilt.TLSKeyFile = cfg.TLSKeyFile
+	rebuilt.SSHHostKey = cfg.SSHHostKey
+	rebuilt.TLS = cfg.TLS
+	rebuilt.SFTP.HostKeyFile = cfg.SFTP.HostKeyFile
+	rebuilt.FTP.PublicHost = cfg.FTP.PublicHost
+	rebuilt.Tenants = cfg.Tenants
+	return reflect.DeepEqual(rebuilt, cfg)
 }
 
 func (c Config) Validate() error {

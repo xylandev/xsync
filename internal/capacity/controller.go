@@ -173,6 +173,25 @@ func (c *Controller) sample() {
 func (c *Controller) Snapshot() Snapshot   { c.mu.RLock(); defer c.mu.RUnlock(); return c.snapshot }
 func (c *Controller) AllowNewUpload() bool { s := c.Snapshot(); return !s.RejectNew && !s.Critical }
 
+// AllowBytes reports whether n more bytes fit before the critical watermark.
+// Callers that transiently need a second copy of an object on disk must budget
+// for it up front, because the watermarks alone only gate *new* uploads.
+func (c *Controller) AllowBytes(n int64) bool {
+	s := c.Snapshot()
+	if s.RejectNew || s.Critical {
+		return false
+	}
+	if n <= 0 || s.TotalBytes == 0 {
+		// TotalBytes is zero only before the first sample; do not reject then.
+		return true
+	}
+	reserve := c.cfg.MinFreeBytes
+	if criticalFree := uint64(float64(s.TotalBytes) * (100 - c.cfg.CriticalPercent) / 100); criticalFree > reserve {
+		reserve = criticalFree
+	}
+	return s.AvailableBytes > reserve && s.AvailableBytes-reserve >= uint64(n)
+}
+
 func (c *Controller) AcquireUpload(ctx context.Context, tenant string) (func(), error) {
 	c.mu.RLock()
 	sem := c.semaphores[tenant]
@@ -190,31 +209,42 @@ func (c *Controller) AcquireUpload(ctx context.Context, tenant string) (func(), 
 }
 
 func (c *Controller) WaitN(ctx context.Context, tenant string, n int) error {
+	if n <= 0 {
+		return nil
+	}
 	if c.Snapshot().Critical {
 		return ErrCriticalCapacity
-	}
-	if n > c.limiter.Burst() {
-		n = c.limiter.Burst()
-	}
-	if err := c.limiter.WaitN(ctx, n); err != nil {
-		return err
 	}
 	c.mu.RLock()
 	tl := c.tenants[tenant]
 	c.mu.RUnlock()
-	if tl != nil {
-		if n > tl.Burst() {
-			n = tl.Burst()
-		}
-		if err := tl.WaitN(ctx, n); err != nil {
+	// A single reservation cannot exceed the limiter's burst, so consume the
+	// request in burst-sized chunks. Truncating instead would let the tail of a
+	// large write bypass both the rate limit and the throughput accounting.
+	chunk := c.limiter.Burst()
+	if tl != nil && tl.Burst() < chunk {
+		chunk = tl.Burst()
+	}
+	if chunk <= 0 {
+		chunk = n
+	}
+	for remaining := n; remaining > 0; {
+		take := min(remaining, chunk)
+		if err := c.limiter.WaitN(ctx, take); err != nil {
 			return err
 		}
+		if tl != nil {
+			if err := tl.WaitN(ctx, take); err != nil {
+				return err
+			}
+		}
+		c.uploaded.Add(uint64(take))
+		remaining -= take
 	}
-	c.uploaded.Add(uint64(n))
 	return nil
 }
 
-func (c *Controller) ObserveDownload(n int) {
+func (c *Controller) ObserveDownload(n int64) {
 	if n > 0 {
 		c.downloaded.Add(uint64(n))
 	}

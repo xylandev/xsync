@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/x509"
+	"encoding/pem"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -126,5 +129,32 @@ func TestAccountAddMigratesGeneratedLegacyConfig(t *testing.T) {
 	}
 	if len(loaded.Tenants) != 2 {
 		t.Fatalf("account count = %d, want 2", len(loaded.Tenants))
+	}
+}
+
+func TestGenerateTLSUsesECDSA(t *testing.T) {
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "tls.crt")
+	keyFile := filepath.Join(dir, "tls.key")
+	if err := generateTLS(certFile, keyFile, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(certFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		t.Fatal("no certificate PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cert.PublicKeyAlgorithm != x509.ECDSA {
+		t.Fatalf("PublicKeyAlgorithm = %s, want ECDSA for client TLS compatibility", cert.PublicKeyAlgorithm)
+	}
+	if len(cert.IPAddresses) != 1 || !cert.IPAddresses[0].Equal(net.ParseIP("127.0.0.1")) {
+		t.Fatalf("IP SANs = %v", cert.IPAddresses)
 	}
 }

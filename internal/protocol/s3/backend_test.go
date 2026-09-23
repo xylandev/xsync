@@ -39,7 +39,7 @@ func (r *gatedReader) Read(p []byte) (int, error) {
 }
 
 func TestBackendPutGetListDelete(t *testing.T) {
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := store.Open(t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestBackendPutGetListDelete(t *testing.T) {
 }
 
 func TestSignedS3SDKRoundTrip(t *testing.T) {
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := store.Open(t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestSignedS3SDKRoundTrip(t *testing.T) {
 }
 
 func TestMultipartPartsForSameUploadRunConcurrently(t *testing.T) {
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := store.Open(t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestMultipartPartsForSameUploadRunConcurrently(t *testing.T) {
 }
 
 func TestCleanupMultipartRemovesExpiredUpload(t *testing.T) {
-	st, err := store.Open(t.TempDir(), nil)
+	st, err := store.Open(t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

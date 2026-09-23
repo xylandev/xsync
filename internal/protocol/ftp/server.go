@@ -34,7 +34,7 @@ func New(cfg config.FTPConfig, tlsCfg config.TLSConfig, tenants []config.Tenant,
 }
 
 func (s *Server) Serve(ctx context.Context) error {
-	d := &driver{cfg: s.cfg, tls: s.tls, tenants: s.tenants, store: s.store}
+	d := &driver{cfg: s.cfg, tls: s.tls, tenants: s.tenants, store: s.store, ctx: ctx}
 	s.server = ftpserver.NewFtpServer(d)
 	s.server.Logger = s.log
 	go func() { <-ctx.Done(); _ = s.server.Stop() }()
@@ -51,13 +51,21 @@ type driver struct {
 	tls     config.TLSConfig
 	tenants []config.Tenant
 	store   *store.Store
+	ctx     context.Context
 }
 
 func (d *driver) GetSettings() (*ftpserver.Settings, error) {
 	return &ftpserver.Settings{ListenAddr: d.cfg.Listen, PublicHost: d.cfg.PublicHost, PassiveTransferPortRange: &ftpserver.PortRange{Start: d.cfg.PassiveStart, End: d.cfg.PassiveEnd}, TLSRequired: ftpserver.ClearOrEncrypted, Banner: "xsync ready", EnableHASH: true, DisableASCIIConversion: true}, nil
 }
 func (d *driver) ClientConnected(ftpserver.ClientContext) (string, error) { return "xsync ready", nil }
-func (d *driver) ClientDisconnected(ftpserver.ClientContext)              {}
+
+// ClientDisconnected cancels the connection context so that a store operation
+// parked on the capacity limiter stops waiting and frees the tenant's upload slot.
+func (d *driver) ClientDisconnected(cc ftpserver.ClientContext) {
+	if cancel, ok := cc.Extra().(context.CancelFunc); ok {
+		cancel()
+	}
+}
 func (d *driver) PreAuthUser(cc ftpserver.ClientContext, user string) error {
 	for _, t := range d.tenants {
 		if t.FTPUser == user {
@@ -69,10 +77,12 @@ func (d *driver) PreAuthUser(cc ftpserver.ClientContext, user string) error {
 	}
 	return cc.SetTLSRequirement(ftpserver.MandatoryEncryption)
 }
-func (d *driver) AuthUser(_ ftpserver.ClientContext, user, pass string) (ftpserver.ClientDriver, error) {
+func (d *driver) AuthUser(cc ftpserver.ClientContext, user, pass string) (ftpserver.ClientDriver, error) {
 	for _, t := range d.tenants {
 		if t.FTPUser == user && subtle.ConstantTimeCompare([]byte(t.FTPPassword), []byte(pass)) == 1 {
-			return &clientFS{tenant: t.ID, store: d.store}, nil
+			ctx, cancel := context.WithCancel(d.ctx)
+			cc.SetExtra(cancel)
+			return &clientFS{tenant: t.ID, store: d.store, ctx: ctx}, nil
 		}
 	}
 	return nil, errors.New("authentication failed")
@@ -88,6 +98,7 @@ func (d *driver) GetTLSConfig() (*tls.Config, error) {
 type clientFS struct {
 	tenant string
 	store  *store.Store
+	ctx    context.Context
 }
 
 func (f *clientFS) Name() string { return "xsync" }
@@ -166,9 +177,9 @@ func (f *clientFS) GetHandle(name string, flags int, offset int64) (ftpserver.Fi
 		var h *store.UploadHandle
 		var err error
 		if offset > 0 || flags&os.O_APPEND != 0 {
-			h, err = f.store.BeginUploadFromCurrent(context.Background(), f.tenant, name, "ftp")
+			h, err = f.store.BeginUploadFromCurrent(f.ctx, f.tenant, name, "ftp")
 		} else {
-			h, err = f.store.BeginUpload(context.Background(), f.tenant, name, "ftp")
+			h, err = f.store.BeginUpload(f.ctx, f.tenant, name, "ftp")
 		}
 		if err != nil {
 			if errors.Is(err, store.ErrUploadBlocked) {

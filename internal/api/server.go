@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -10,7 +11,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +27,9 @@ type Server struct {
 }
 
 func New(st *store.Store, cap *capacity.Controller, tenants []config.Tenant, log *slog.Logger) http.Handler {
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
 	s := &Server{store: st, cap: cap, log: log, keys: map[string]string{}}
 	for _, t := range tenants {
 		if t.APIKeySHA256 != "" {
@@ -44,10 +47,11 @@ func New(st *store.Store, cap *capacity.Controller, tenants []config.Tenant, log
 	mux.Handle("DELETE /v1/claims/{lease}", s.auth(http.HandlerFunc(s.release)))
 	mux.Handle("GET /v1/objects/{object}/content", s.auth(http.HandlerFunc(s.content)))
 	mux.Handle("POST /v1/objects/{object}/commit", s.auth(http.HandlerFunc(s.commit)))
-	return mux
+	return s.accessLog(mux)
 }
 
 type contextKey struct{}
+
 type authHandler struct {
 	next   http.Handler
 	server *Server
@@ -62,19 +66,42 @@ func (h authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	sum := sha256.Sum256([]byte(token))
 	encoded := hex.EncodeToString(sum[:])
-	var tenant string
+	var tenantID string
 	for digest, id := range h.server.keys {
 		if len(digest) == len(encoded) && subtle.ConstantTimeCompare([]byte(digest), []byte(encoded)) == 1 {
-			tenant = id
+			tenantID = id
 			break
 		}
 	}
-	if tenant == "" {
+	if tenantID == "" {
 		writeError(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
-	r.Header.Set("X-Xsync-Tenant", tenant)
-	h.next.ServeHTTP(w, r)
+	// The authenticated tenant travels in the request context, not in a header:
+	// headers are client-controlled input and must not share a namespace with a
+	// server-side authorization decision.
+	if rec, ok := w.(*recorder); ok {
+		rec.tenant = tenantID
+	}
+	h.next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), contextKey{}, tenantID)))
+}
+
+// accessLog wraps the ResponseWriter exactly once, so that the audit trail, the
+// download byte accounting, and net/http's ReaderFrom fast path can coexist.
+func (s *Server) accessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &recorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		level := slog.LevelInfo
+		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+			level = slog.LevelDebug
+		}
+		s.log.Log(r.Context(), level, "download API request",
+			"method", r.Method, "path", r.URL.Path, "status", rec.status,
+			"bytes", rec.written, "tenant", rec.tenant, "remote", r.RemoteAddr,
+			"duration", time.Since(start))
+	})
 }
 
 func (s *Server) ready(w http.ResponseWriter, _ *http.Request) {
@@ -86,7 +113,10 @@ func (s *Server) ready(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, snap)
 }
 
-func tenant(r *http.Request) string { return r.Header.Get("X-Xsync-Tenant") }
+func tenant(r *http.Request) string {
+	id, _ := r.Context().Value(contextKey{}).(string)
+	return id
+}
 
 func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -152,20 +182,63 @@ func (s *Server) content(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("ETag", `"sha256:`+o.SHA256+`"`)
 	w.Header().Set("X-Content-SHA256", o.SHA256)
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepathBase(o.Path)))
-	observer := &observedWriter{ResponseWriter: w, observe: s.cap.ObserveDownload}
-	http.ServeContent(observer, r, filepathBase(o.Path), o.CreatedAt, f)
+	// Count only object content towards the capacity controller's drain estimate.
+	if rec, ok := w.(*recorder); ok {
+		rec.observe = s.cap.ObserveDownload
+	}
+	http.ServeContent(w, r, filepathBase(o.Path), o.CreatedAt, f)
 }
 
-type observedWriter struct {
+// recorder captures the status code and transferred size for the access log, and
+// optionally reports content bytes to the capacity controller.
+//
+// It deliberately forwards io.ReaderFrom: wrapping a ResponseWriter in a struct
+// hides the underlying ReadFrom method, which would otherwise downgrade every
+// download to a 32 KiB userspace copy loop instead of net/http's sendfile path.
+type recorder struct {
 	http.ResponseWriter
-	observe func(int)
+	status  int
+	written int64
+	tenant  string
+	observe func(int64)
 }
 
-func (w *observedWriter) Write(p []byte) (int, error) {
+func (w *recorder) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *recorder) Write(p []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(p)
-	w.observe(n)
+	w.record(int64(n))
 	return n, err
 }
+
+func (w *recorder) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		n, err := rf.ReadFrom(r)
+		w.record(n)
+		return n, err
+	}
+	// Copy into the bare ResponseWriter so this method is not re-entered.
+	n, err := io.Copy(w.ResponseWriter, r)
+	w.record(n)
+	return n, err
+}
+
+func (w *recorder) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *recorder) record(n int64) {
+	w.written += n
+	if w.observe != nil {
+		w.observe(n)
+	}
+}
+
 func filepathBase(p string) string {
 	if i := strings.LastIndexByte(p, '/'); i >= 0 {
 		return p[i+1:]
@@ -213,11 +286,4 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
-}
-
-func ParseRangeOffset(value string) int64 {
-	value = strings.TrimPrefix(value, "bytes=")
-	value = strings.TrimSuffix(value, "-")
-	n, _ := strconv.ParseInt(value, 10, 64)
-	return n
 }

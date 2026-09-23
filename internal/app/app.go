@@ -29,7 +29,7 @@ func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	capController := capacity.New(cfg.DataDir, cfg.Capacity, cfg.Tenants)
 	capDone := make(chan struct{})
 	go func() { defer close(capDone); capController.Run(ctx) }()
-	st, err := store.Open(cfg.DataDir, capController)
+	st, err := store.Open(cfg.DataDir, capController, log)
 	if err != nil {
 		return err
 	}

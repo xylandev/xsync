@@ -22,7 +22,7 @@ import (
 func TestClaimRangeAndCommit(t *testing.T) {
 	root := t.TempDir()
 	cap := capacity.New(root, config.Default().Capacity, nil)
-	st, err := store.Open(root, cap)
+	st, err := store.Open(root, cap, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,4 +88,49 @@ func TestClaimRangeAndCommit(t *testing.T) {
 		t.Fatal("committed object remains")
 	}
 	_ = time.Second
+}
+
+// The authenticated tenant must come from the request context, never from a
+// header a client can set.
+func TestTenantHeaderIsNotTrusted(t *testing.T) {
+	root := t.TempDir()
+	cap := capacity.New(root, config.Default().Capacity, nil)
+	st, err := store.Open(root, cap, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	h, err := st.BeginUpload(context.Background(), "victim", "secret.txt", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h.WriteAt([]byte("confidential"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = h.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	key := "attacker-key"
+	sum := sha256.Sum256([]byte(key))
+	handler := New(st, cap, []config.Tenant{
+		{ID: "attacker", APIKeySHA256: hex.EncodeToString(sum[:])},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/claims", bytes.NewBufferString(`{"client_id":"c"}`))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Xsync-Tenant", "victim")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	// The attacker's own queue is empty, so a spoof-proof server answers 204.
+	if resp.StatusCode != http.StatusNoContent {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("spoofed tenant header changed the result: status=%d body=%s", resp.StatusCode, raw)
+	}
 }
