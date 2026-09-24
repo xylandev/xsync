@@ -29,8 +29,6 @@ func CleanPath(name string) (string, error) {
 	return clean, nil
 }
 
-func nsKey(tenant, name string) []byte { return []byte(tenant + "\x00" + name) }
-
 // pathHasPrefix reports whether name is prefix itself or sits under it. Matching
 // on path segments keeps a prefix of "data" from also selecting "database.txt".
 func pathHasPrefix(name, prefix string) bool {

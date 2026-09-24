@@ -34,9 +34,12 @@ COPY --from=builder /out/xsync-server /xsync-server
 USER 65532:65532
 WORKDIR /data
 VOLUME ["/data", "/etc/xsync"]
-EXPOSE 2022 2121 9000 9443 30000-30100
+EXPOSE 2022 2121 9000 9443 9090 30000-30100
 
+# SIGTERM drains: new uploads are refused while transfers in flight get
+# shutdown_grace (40s) to finish. SIGHUP reloads accounts and certificates.
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["/xsync-server"]
 CMD ["serve", "--config", "/etc/xsync/config.yaml"]
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
-  CMD ["/xsync-server", "healthcheck", "--url", "http://127.0.0.1:9090/metrics"]
+  CMD ["/xsync-server", "healthcheck", "--url", "http://127.0.0.1:9090/healthz"]

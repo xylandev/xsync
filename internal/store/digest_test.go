@@ -131,8 +131,8 @@ func TestResumedUploadDigestMatchesContents(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.TransferError(io.ErrUnexpectedEOF)
-	if err = h.Close(); err != nil {
-		t.Fatal(err)
+	if err = h.Close(); err == nil {
+		t.Fatal("interrupted upload reported success")
 	}
 
 	resumed, err := s.BeginUploadFromCurrent(context.Background(), "t", "resume.bin", "test")

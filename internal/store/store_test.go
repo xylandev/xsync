@@ -169,17 +169,18 @@ func TestInterruptedUploadCanResume(t *testing.T) {
 	}
 	_, _ = h.WriteAt([]byte("hello"), 0)
 	h.TransferError(errors.New("disconnect"))
-	if err = h.Close(); err != nil {
-		t.Fatal(err)
+	if err = h.Close(); err == nil {
+		t.Fatal("interrupted upload reported success")
 	}
 	resumed, err := s.BeginUploadFromCurrent(context.Background(), "t", "file", "test")
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The base is chosen by the first write: offset 5 continues the partial.
+	_, _ = resumed.WriteAt([]byte(" world"), 5)
 	if resumed.ID() != h.ID() {
 		t.Fatalf("created new upload %s, wanted resume %s", resumed.ID(), h.ID())
 	}
-	_, _ = resumed.WriteAt([]byte(" world"), 5)
 	if err = resumed.Close(); err != nil {
 		t.Fatal(err)
 	}

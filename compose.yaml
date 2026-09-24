@@ -21,13 +21,19 @@ services:
       - type: bind
         source: ${XSYNC_DATA_DIR:?set XSYNC_DATA_DIR to the mounted data disk}
         target: /data
+    # Host and container ports must be identical: the server advertises its
+    # own ports in connection bundles and in FTP passive replies. To change a
+    # port, change the listen address in config.yaml and both sides here.
     ports:
-      - "${XSYNC_SFTP_PORT:-2022}:2022"
-      - "${XSYNC_FTP_PORT:-2121}:2121"
-      - "${XSYNC_FTP_PASSIVE_START:-30000}-${XSYNC_FTP_PASSIVE_END:-30100}:30000-30100"
-      - "${XSYNC_S3_PORT:-9000}:9000"
-      - "${XSYNC_API_PORT:-9443}:9443"
-    stop_grace_period: 45s
+      - "2022:2022"
+      - "2121:2121"
+      - "30000-30100:30000-30100"
+      - "9000:9000"
+      - "9443:9443"
+      # Metrics and the admin API stay on the host's loopback interface.
+      - "127.0.0.1:9090:9090"
+    # shutdown_grace (40s) plus a margin for the final abort.
+    stop_grace_period: 50s
     ulimits:
       nofile:
         soft: 1048576

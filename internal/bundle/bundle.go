@@ -81,7 +81,14 @@ func New(cfg config.Config, tenant config.Tenant, secrets Secrets) (Document, er
 	if host == "" {
 		return Document{}, errors.New("public_host is required to generate a client connection bundle")
 	}
-	caPEM, certFingerprint, err := certificateMaterial(cfg.TLS.CertFile)
+	// Bundles trust the long-lived CA when there is one, so renewing the
+	// serving certificate never invalidates them. Older deployments pin their
+	// self-signed certificate directly.
+	trust := cfg.TLS.CACertFile
+	if trust == "" {
+		trust = cfg.TLS.CertFile
+	}
+	caPEM, certFingerprint, err := certificateMaterial(trust)
 	if err != nil {
 		return Document{}, err
 	}
@@ -133,6 +140,9 @@ func New(cfg config.Config, tenant config.Tenant, secrets Secrets) (Document, er
 		},
 	}, nil
 }
+
+// Marshal renders a bundle as YAML.
+func Marshal(doc Document) ([]byte, error) { return yaml.Marshal(doc) }
 
 func Write(path string, doc Document, replace bool) error {
 	raw, err := yaml.Marshal(doc)

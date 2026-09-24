@@ -1,109 +1,290 @@
+// Package app wires the server together and owns its lifecycle.
 package app
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/xylandev/xsync/internal/api"
 	"github.com/xylandev/xsync/internal/capacity"
+	"github.com/xylandev/xsync/internal/certstore"
 	"github.com/xylandev/xsync/internal/config"
+	"github.com/xylandev/xsync/internal/metrics"
+	"github.com/xylandev/xsync/internal/netguard"
 	"github.com/xylandev/xsync/internal/platform"
 	ftpadapter "github.com/xylandev/xsync/internal/protocol/ftp"
 	s3adapter "github.com/xylandev/xsync/internal/protocol/s3"
 	sftpadapter "github.com/xylandev/xsync/internal/protocol/sftp"
 	"github.com/xylandev/xsync/internal/store"
+	"github.com/xylandev/xsync/internal/tenant"
 )
 
+// Options carries process-level inputs that are not configuration.
+type Options struct {
+	// Reload receives a value when accounts and certificates should be
+	// reloaded (SIGHUP).
+	Reload  <-chan struct{}
+	Version string
+}
+
 func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
-	if err := platform.ValidateDataDir(cfg.DataDir, cfg.RequireMount, cfg.Capacity.MinFreeBytes); err != nil {
-		return err
+	return RunWithOptions(ctx, cfg, log, Options{})
+}
+
+// policyFor maps an account to the store's delivery policy.
+func policyFor(reg *tenant.Registry, defaults config.DeliveryConfig) func(string) store.Policy {
+	return func(id string) store.Policy {
+		t, _ := reg.Load().Get(id)
+		max := t.MaxAttempts
+		if max <= 0 {
+			max = defaults.MaxAttempts
+		}
+		return store.Policy{
+			Supersede:      t.EffectiveOverwrite() == config.OverwriteSupersede,
+			HoldPatterns:   t.EffectiveHoldPatterns(),
+			PublishDelay:   t.PublishDelay,
+			MaxAttempts:    max,
+			MaxStoredBytes: t.MaxStoredBytes,
+		}
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	capController := capacity.New(cfg.DataDir, cfg.Capacity, cfg.Tenants)
-	capDone := make(chan struct{})
-	go func() { defer close(capDone); capController.Run(ctx) }()
-	st, err := store.Open(cfg.DataDir, capController, log)
+}
+
+type server struct {
+	name  string
+	serve func(context.Context) error
+	// drain stops accepting work and waits (bounded by ctx) for requests in
+	// flight; abort ends whatever is left.
+	drain func(context.Context)
+	abort func()
+}
+
+func RunWithOptions(ctx context.Context, cfg config.Config, log *slog.Logger, opts Options) error {
+	report, err := platform.CheckDataDir(cfg.DataDir, cfg.RequireMount, cfg.DataVolumeID, cfg.Capacity.MinFreeBytes)
 	if err != nil {
 		return err
 	}
-	defer st.Close()
-	maintainDone := make(chan struct{})
-	go func() { defer close(maintainDone); st.Maintain(ctx, 30*time.Second, cfg.PartialTTL) }()
-	errCh := make(chan error, 5)
-	var wg sync.WaitGroup
-	start := func(name string, fn func(context.Context) error) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if e := fn(ctx); e != nil && ctx.Err() == nil {
-				errCh <- fmt.Errorf("%s: %w", name, e)
-			}
-		}()
+	for _, w := range report.Warnings {
+		log.Warn(w)
+	}
+	reg := tenant.NewRegistry(cfg.Tenants)
+	capController := capacity.New(cfg.DataDir, cfg.Capacity, cfg.Tenants)
+	reg.Subscribe(func(s *tenant.Snapshot) { capController.SyncTenants(s.All()) })
+	capController.Sample()
+
+	st, err := store.OpenWithOptions(cfg.DataDir, store.Options{Gate: capController, Log: log, Policy: policyFor(reg, cfg.Delivery), TombstoneTTL: cfg.Delivery.TombstoneTTL})
+	if err != nil {
+		return err
+	}
+	certs, err := certstore.New(cfg.TLS.CertFile, cfg.TLS.KeyFile)
+	if err != nil {
+		st.Close()
+		return err
+	}
+	if left := time.Until(certs.NotAfter()); left < 30*24*time.Hour {
+		log.Warn("TLS certificate expires soon; run 'xsync-server cert renew'", "not_after", certs.NotAfter())
 	}
 
-	downloadServer := &http.Server{Addr: cfg.Download.Listen, Handler: api.New(st, capController, cfg.Tenants, log), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
-	start("download API", func(ctx context.Context) error {
-		go func() {
-			<-ctx.Done()
-			c, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			_ = downloadServer.Shutdown(c)
-		}()
-		log.Info("download API listening", "addr", cfg.Download.Listen)
-		e := downloadServer.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile)
-		if errors.Is(e, http.ErrServerClosed) {
-			return nil
-		}
-		return e
+	runCtx, stopBackground := context.WithCancel(context.Background())
+	var background sync.WaitGroup
+	goBackground := func(fn func()) {
+		background.Add(1)
+		go func() { defer background.Done(); fn() }()
+	}
+	goBackground(func() { capController.Run(runCtx) })
+	goBackground(func() {
+		st.MaintainWith(runCtx, store.MaintainOptions{
+			Interval: 30 * time.Second, PartialTTL: cfg.PartialTTL,
+			// Under disk pressure abandoned partials give way sooner.
+			PressureTTL: time.Hour, Pressure: func() bool { return capController.Snapshot().RejectNew },
+		})
 	})
-	metricsServer := &http.Server{Addr: cfg.Metrics.Listen, Handler: metricsHandler(st, capController), ReadHeaderTimeout: 5 * time.Second}
-	start("metrics", func(ctx context.Context) error {
-		go func() { <-ctx.Done(); _ = metricsServer.Close() }()
-		log.Info("metrics listening", "addr", cfg.Metrics.Listen)
-		e := metricsServer.ListenAndServe()
-		if errors.Is(e, http.ErrServerClosed) {
-			return nil
+	reload := func(reason string) {
+		tenants, err := cfg.LoadAccounts()
+		if err != nil {
+			log.Error("account reload failed; keeping the current accounts", "reason", reason, "error", err)
+			return
 		}
-		return e
-	})
+		reg.Replace(tenants)
+		if err := certs.Reload(); err != nil {
+			log.Error("certificate reload failed", "error", err)
+		}
+		log.Info("accounts reloaded", "reason", reason, "accounts", len(tenants))
+	}
+	goBackground(func() { watchAccounts(runCtx, cfg, opts.Reload, reload) })
+
+	auth := netguard.NewAuthLimiter(cfg.Limits.AuthFailuresPerMinute)
+	reg2 := metrics.New()
+	draining := func() bool { return st.Draining() }
+
+	var servers []server
+	apiHandler := api.New(st, capController, reg, api.Options{MaxLease: cfg.Delivery.MaxLease, MaxLongPoll: cfg.Delivery.MaxLongPoll, MaxBatch: cfg.Delivery.MaxBatch, IdleTimeout: cfg.Limits.IdleTimeout, Auth: auth, Metrics: reg2, Draining: draining}, log)
+	servers = append(servers, httpServer("download API", cfg.Download.Listen, apiHandler, certs, cfg.Limits, log))
+	var sftpSrv *sftpadapter.Server
+	var ftpSrv *ftpadapter.Server
 	if cfg.SFTP.Enabled {
-		srv := sftpadapter.New(cfg.SFTP, cfg.Tenants, st, log)
-		start("sftp", srv.Serve)
+		sftpSrv = sftpadapter.New(cfg.SFTP, reg, st, sftpadapter.Options{Limits: cfg.Limits, Auth: auth}, log)
+		servers = append(servers, server{name: "sftp", serve: sftpSrv.Serve, drain: func(context.Context) {}, abort: sftpSrv.Abort})
 	}
 	if cfg.FTP.Enabled {
-		srv := ftpadapter.New(cfg.FTP, cfg.TLS, cfg.Tenants, st, log)
-		start("ftp", srv.Serve)
+		ftpSrv = ftpadapter.New(cfg.FTP, reg, st, ftpadapter.Options{Limits: cfg.Limits, Auth: auth, Certs: certs}, log)
+		servers = append(servers, server{name: "ftp", serve: ftpSrv.Serve, drain: func(context.Context) {}, abort: ftpSrv.Abort})
 	}
 	if cfg.S3.Enabled {
-		srv := s3adapter.New(cfg.S3, cfg.TLS, cfg.Tenants, st, cfg.PartialTTL, log)
-		start("s3", srv.Serve)
+		s3Srv := s3adapter.New(cfg.S3, reg, st, s3adapter.Options{Limits: cfg.Limits, Auth: auth, Certs: certs, PartialTTL: cfg.PartialTTL}, log)
+		servers = append(servers, server{name: "s3", serve: s3Srv.Serve, drain: func(c context.Context) { _ = s3Srv.Shutdown(c) }, abort: s3Srv.Abort})
 	}
+	registerMetrics(reg2, metricSources{store: st, capacity: capController, tenants: reg, certs: certs, auth: auth, sftp: sftpSrv, ftp: ftpSrv, version: opts.Version})
+	adminToken := ""
+	if p := cfg.AdminTokenPath(); p != "" {
+		if raw, err := os.ReadFile(p); err == nil {
+			adminToken = strings.TrimSpace(string(raw))
+		} else {
+			log.Warn("admin token file unreadable; admin API disabled", "error", err)
+		}
+	}
+	if cfg.Metrics.Listen != "" {
+		ops := opsHandler(opsDeps{store: st, capacity: capController, tenants: reg, metrics: reg2, token: adminToken, reload: func() { reload("admin API") }, draining: draining, log: log})
+		servers = append(servers, plainHTTPServer("metrics", cfg.Metrics.Listen, ops, log))
+	}
+
+	acceptCtx, stopAccepting := context.WithCancel(context.Background())
+	errCh := make(chan error, len(servers))
+	var running sync.WaitGroup
+	for _, s := range servers {
+		running.Add(1)
+		go func(s server) {
+			defer running.Done()
+			if err := s.serve(acceptCtx); err != nil && acceptCtx.Err() == nil {
+				errCh <- fmt.Errorf("%s: %w", s.name, err)
+			}
+		}(s)
+	}
+	log.Info("xsync server started", "version", opts.Version, "accounts", len(cfg.Tenants), "drain_only", report.LowSpace)
 
 	select {
 	case <-ctx.Done():
 	case err = <-errCh:
+		log.Error("listener failed; shutting down", "error", err)
 	}
-	cancel()
-	wg.Wait()
-	<-capDone
-	<-maintainDone
+
+	// Phase one: stop taking new work. Uploads and downloads in flight may
+	// finish within the grace period.
+	log.Info("draining", "grace", cfg.ShutdownGrace, "uploads_in_flight", st.InFlight())
+	st.Drain()
+	stopAccepting()
+	graceCtx, cancelGrace := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
+	var drained sync.WaitGroup
+	for _, s := range servers {
+		drained.Add(1)
+		go func(s server) { defer drained.Done(); s.drain(graceCtx) }(s)
+	}
+	drained.Add(1)
+	go func() { defer drained.Done(); _ = st.WaitIdle(graceCtx) }()
+	drained.Wait()
+	cancelGrace()
+	// Phase two: end whatever is left. Open uploads become resumable
+	// partials; interrupted downloads are redelivered after their lease.
+	if n := st.InFlight(); n > 0 {
+		log.Warn("grace period over; aborting remaining transfers", "uploads_in_flight", n)
+	}
+	for _, s := range servers {
+		s.abort()
+	}
+	running.Wait()
+	abortCtx, cancelAbort := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = st.WaitIdle(abortCtx)
+	cancelAbort()
+	stopBackground()
+	background.Wait()
+	if cerr := st.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+	log.Info("xsync server stopped")
 	return err
 }
 
-func metricsHandler(st *store.Store, cap *capacity.Controller) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
-		s := cap.Snapshot()
-		db, _ := st.Stats()
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		fmt.Fprintf(w, "xsync_disk_total_bytes %d\nxsync_disk_available_bytes %d\nxsync_disk_used_percent %.4f\nxsync_upload_bytes_per_second %.4f\nxsync_download_bytes_per_second %.4f\nxsync_delete_bytes_per_second %.4f\nxsync_upload_limit_bytes_per_second %.4f\nxsync_objects %d\nxsync_ready_objects %d\nxsync_leased_objects %d\nxsync_delete_pending_objects %d\nxsync_active_uploads %d\n", s.TotalBytes, s.AvailableBytes, s.UsedPercent, s.UploadBPS, s.DownloadBPS, s.DeleteBPS, s.UploadLimitBPS, db.Objects, db.Ready, db.Leased, db.DeletePending, db.Uploads)
-	})
-	return mux
+// watchAccounts reloads the account table on SIGHUP and when the accounts
+// file changes, so `account add` and friends take effect without a restart.
+func watchAccounts(ctx context.Context, cfg config.Config, signal <-chan struct{}, reload func(string)) {
+	path := cfg.ResolvedAccountsFile()
+	if path == "" {
+		path = cfg.Path()
+	}
+	modTime := func() time.Time {
+		if st, err := os.Stat(path); err == nil {
+			return st.ModTime()
+		}
+		return time.Time{}
+	}
+	last := modTime()
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-signal:
+			last = modTime()
+			reload("signal")
+		case <-t.C:
+			if m := modTime(); !m.Equal(last) {
+				last = m
+				reload("accounts file changed")
+			}
+		}
+	}
+}
+
+func httpServer(name, addr string, h http.Handler, certs *certstore.Store, limits config.LimitsConfig, log *slog.Logger) server {
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute, TLSConfig: certs.TLSConfig(), MaxHeaderBytes: 64 << 10, ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelDebug)}
+	return server{
+		name: name,
+		serve: func(ctx context.Context) error {
+			inner, err := net.Listen("tcp", addr)
+			if err != nil {
+				return err
+			}
+			ln := netguard.NewListener(inner, netguard.Limits{MaxConns: limits.MaxConnections, MaxConnsPerIP: limits.MaxConnectionsPerIP})
+			go func() { <-ctx.Done(); _ = ln.Close() }()
+			log.Info(name+" listening", "addr", addr)
+			err = srv.ServeTLS(ln, "", "")
+			if errors.Is(err, http.ErrServerClosed) || ctx.Err() != nil {
+				return nil
+			}
+			return err
+		},
+		drain: func(ctx context.Context) { _ = srv.Shutdown(ctx) },
+		abort: func() { _ = srv.Close() },
+	}
+}
+
+func plainHTTPServer(name, addr string, h http.Handler, log *slog.Logger) server {
+	srv := &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 5 * time.Second, ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelDebug)}
+	return server{
+		name: name,
+		serve: func(ctx context.Context) error {
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				return err
+			}
+			log.Info(name+" listening", "addr", addr)
+			// It keeps serving until abort, not until accepting stops, so
+			// the drain itself can be observed.
+			err = srv.Serve(ln)
+			if errors.Is(err, http.ErrServerClosed) {
+				return nil
+			}
+			return err
+		},
+		drain: func(context.Context) {},
+		abort: func() { _ = srv.Close() },
+	}
 }

@@ -25,23 +25,21 @@ func (s *Store) scanStats() (Stats, error) {
 				continue
 			}
 			out.Objects++
+			out.Bytes += o.Size
 			switch o.State {
 			case model.StateReady:
 				out.Ready++
 			case model.StateLeased:
 				out.Leased++
-			case model.StateDeletePending:
-				out.DeletePending++
+			case model.StateHeld:
+				out.Held++
+			case model.StateParked:
+				out.Parked++
 			}
 		}
-		uc := tx.Bucket(bUploads).Cursor()
-		for k, _ := uc.First(); k != nil; k, _ = uc.Next() {
-			out.Uploads++
-		}
-		cc := tx.Bucket(bClaims).Cursor()
-		for k, _ := cc.First(); k != nil; k, _ = cc.Next() {
-			out.Claims++
-		}
+		out.Uploads = tx.Bucket(bUploads).Stats().KeyN
+		out.Claims = tx.Bucket(bClaims).Stats().KeyN
+		out.DeletePending = tx.Bucket(bGC).Stats().KeyN
 		return nil
 	})
 	return out, err
@@ -96,8 +94,8 @@ func TestStatsCountersTrackCatalogThroughEveryTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.TransferError(errors.New("disconnect"))
-	if err = h.Close(); err != nil {
-		t.Fatal(err)
+	if err = h.Close(); err == nil {
+		t.Fatal("interrupted upload reported success")
 	}
 	check("after interrupt")
 
@@ -126,7 +124,13 @@ func TestStatsCountersTrackCatalogThroughEveryTransition(t *testing.T) {
 	}
 	check("after commit")
 
-	if err = s.Remove("t", "dir/b.bin"); err != nil {
+	// Released objects go to the tail of the queue, so the second claim took
+	// whichever object was not released; remove the other one.
+	remaining := "a.bin"
+	if claim.Path == "a.bin" {
+		remaining = "dir/b.bin"
+	}
+	if err = s.Remove("t", remaining); err != nil {
 		t.Fatal(err)
 	}
 	check("after remove")

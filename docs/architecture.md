@@ -1,245 +1,182 @@
 # xsync 产品与架构说明
 
-`xsync-server` 是单机、多租户的**文件中转服务**。上传方用现成的 SFTP、显式 FTPS 或兼容 S3 的客户端把文件写入暂存盘；下载方通过专用 HTTPS API 认领不可变文件版本，校验 SHA-256 后确认删除。
+`xsync-server` 是单机、多租户的**文件中转服务**：
 
-它不是网盘，也不是长期对象存储。磁盘是中转暂存盘：文件进来、被认领、校验通过后删除。部署与运维步骤见仓库根目录 [README.md](../README.md)。
+- 上传方用现成的 SFTP、显式 FTPS 或兼容 S3 的客户端，把文件写入暂存盘；
+- 下载方通过专用 HTTPS API 认领不可变的文件版本，校验 SHA-256 后确认删除。
 
-## 1. 定位与适用场景
+它不是网盘，也不是长期对象存储。磁盘只做中转暂存：文件进来、被认领、校验通过后删除。部署与运维步骤见 [README](../README.md)，下载 API 契约见 [api.md](api.md)。
 
-适合「客户侧已经有上传工具、我方需要可靠地收下并清走」的场景，例如：
+## 1. 定位
 
-- 合作方用 SFTP / FTP 客户端或 AWS 兼容 SDK 推送数据包
-- 内部下载进程按队列拉取、校验、落库或转存后，让中转盘尽快腾出空间
-- 多客户共用一台中转机，账号之间目录、bucket、凭证隔离
+适合的场景是：客户那边已经有上传工具，我方需要可靠地收下文件并及时清走。例如：
 
-不适合：作为永久文件库、做跨机集群、提供完整 AWS S3 控制面（ACL、生命周期、复制、对象锁、S3 版本控制均不在范围内）。
+- 合作方用 SFTP/FTP 客户端或 AWS 兼容 SDK 推送数据包；
+- 内部下载进程按队列拉取、校验、落库或转存，让中转盘尽快腾出空间；
+- 多个客户共用一台中转机，账号之间的目录、bucket、凭证和配额相互隔离。
+
+不适合：永久文件库、跨机集群、完整的 AWS S3 控制面。
 
 ## 2. 总体架构
 
-一个进程、一块数据盘、一套共享 Store。进程内并行监听上传、下载和本机指标。
-
 ```text
-上传 SDK ── SFTP :2022 ──┐
-上传 SDK ── FTPS :2121 ──┼── Store (staging → objects + bbolt catalog)
-上传 SDK ── S3   :9000 ──┘         ▲
-                                   │ 容量控制器（水位 / 限速 / 租户配额）
-下载客户端 ── HTTPS :9443 ─────────┘
-本机监控 ── 127.0.0.1:9090/metrics
+上传 ── SFTP  :2022 ─┐   认证/限流/超时（netguard）      ┌─ 租户注册表（热加载）
+上传 ── FTPS  :2121 ─┼── 协议适配器 ── UploadHandle ────┤
+上传 ── S3    :9000 ─┘   （S3 前置守卫）                 └─ 容量控制器（水位/预算/预留/槽位）
+                                    │
+                                 Store：blob 文件 + bbolt catalog（主记录 + 可重建索引）
+                                    │
+下载 ── HTTPS :9443 ── 下载 API（批量认领/长轮询/租约/死信）
+运维 ── HTTP  :9090 ── /metrics /healthz /readyz /admin/*（管理令牌）
 ```
 
-| 面 | 默认地址 | 传输 | 用途 |
-|---|---|---|---|
-| SFTP | `:2022` | SSH，密码或公钥 | 上传 |
-| FTP / 显式 FTPS | `:2121`，被动口 `30000–30100` | 默认强制 TLS | 上传 |
-| S3 兼容 | `:9000` | HTTPS + SigV4，path-style | 上传（及对象读写） |
-| 下载 API | `:9443` | HTTPS + Bearer API Key | 认领 / 下载 / 确认删除 |
-| 指标 | `127.0.0.1:9090/metrics` | 明文，仅本机 | 健康检查与 Prometheus |
+代码结构：
 
-三个上传前端写入同一套 Store。下载**不走** S3/SFTP 队列语义，只走带租约的 HTTPS API。容量控制器采样磁盘水位，按上传/下载/删除吞吐的 EWMA 调节写入预算。
+| 包 | 职责 |
+|---|---|
+| `internal/store` | 目录与数据面。`store.go` 负责生命周期与写事务；`schema.go` 负责 bucket 布局、键编码和索引重建；`upload.go` 负责上传会话；`delivery.go` 负责认领、租约、提交和死信；`namespace.go` 是上传方看到的文件树；`maintain.go` 负责恢复、维护和对账 |
+| `internal/protocol/{sftp,ftp,s3}` | 把各协议的语义翻译成 Store 操作 |
+| `internal/api` | 下载 API |
+| `internal/capacity` | 磁盘水位、上传预算、按租户分配份额、空间预留、并发槽位 |
+| `internal/tenant` | 账号快照与索引，原子替换，支持订阅变更 |
+| `internal/netguard` | 连接数上限、空闲与停滞超时、认证失败限速 |
+| `internal/certstore` | 证书热加载 |
+| `internal/metrics` | Prometheus 文本格式指标 |
+| `internal/app` | 装配、两阶段关闭、运维与管理接口 |
+
+## 3. 数据模型与目录
 
 数据盘布局：
 
 ```text
 <data_dir>/
-  staging/                 未完成上传
+  .xsync-volume            数据卷标记（与配置里的 data_volume_id 一致才会启动）
+  staging/<tenant>/…       未完成的上传
+  staging/s3-multipart/…   S3 分片上传
   objects/<tenant>/<id>.blob
-  metadata/catalog.db      bbolt：对象、命名空间、队列、租约、墓碑
+  metadata/catalog.db      bbolt 目录
 ```
 
-## 3. 核心概念
+目录分为**主记录**和**索引**。索引可以随时从主记录重建（`catalog repair`，或管理接口 `rebuild-indexes`）。
 
-**租户（账号）**  
-一个账号对应一个隔离 tenant，一次获得 SFTP、FTPS、S3、下载 API 四组凭证。账号 ID 默认同时作为 SFTP/FTP 用户名和 S3 bucket。
-
-**对象版本**  
-每次成功关闭的上传成为一条不可变记录，带独立 object ID、路径、大小、SHA-256。同一逻辑路径被覆盖时，namespace 指向新 ID；旧版本仍按自己的 ID 走完下载和删除，不会误删新文件。
-
-**下载租约**  
-下载端 `claim` 成功后对象进入 `LEASED`。拉取内容必须携带租约 ID。租约过期后对象回到 `READY`，可被再次认领。
-
-**连接包**  
-`account add` 生成 `client-configs/<id>.yaml`（权限 `0600`）：服务地址、四套凭证、CA 公钥、TLS/SSH 指纹。不含服务器私钥，应经安全渠道交给使用者。
-
-## 4. 上传协议
-
-路径会规范化（去前导 `/`、禁止 `..` 与 NUL）。写入先进入 `staging/`，客户端成功关闭后才会发布到下载队列。
-
-### SFTP
-
-- 密码认证；租户还可配置 `authorized_keys`
-- 现代 OpenSSH 的 `sftp` 与默认 `scp`（走 SFTP subsystem）可用
-- 中断的上传可按路径续传（`INTERRUPTED`）
-
-### FTP / FTPS
-
-- 显式 TLS（AUTH TLS），默认强制加密
-- 仅当该租户 `allow_plain_ftp: true` 时接受明文 FTP
-- 被动模式地址使用 `--advertise-ip` / `public_host`
-- 修改被动端口范围时，必须同步改 Compose 端口映射和防火墙
-
-### S3 兼容
-
-- HTTPS 端点，path-style，region `us-east-1`
-- 凭证为账号的 access key / secret key，bucket 默认等于账号 ID
-- 支持核心对象操作、Range、multipart
-- **不支持** ACL、生命周期、复制、对象锁、S3 版本控制
-- 前端嵌入 `go-faster/fs`；上游仍标注为开发/测试用途，未经目标客户端兼容性与故障测试前，不能单独作为生产发布依据
-
-本地可行验证中已跑通的上传客户端：paramiko、OpenSSH `sftp`/`scp`、Go `pkg/sftp`、Python `ftplib.FTP_TLS`、lftp、curl FTPS、Go `goftp`、boto3（单件与 multipart）、minio-py、Node AWS SDK v3、Go AWS SDK v2。
-
-## 5. 下载 API
-
-所有 `/v1/` 请求：
-
-```http
-Authorization: Bearer <API Key>
-```
-
-TLS 使用连接包里的 `security.tls_ca_pem` 校验服务端证书（证书算法为 ECDSA P-256，IP SAN 为 `advertise-ip`）。
-
-未认证探测：
-
-- `GET /healthz` → `200` / `ok`
-- `GET /readyz` → 容量危急时 `503`
-
-### 认领
-
-```http
-POST /v1/claims
-Content-Type: application/json
-
-{"client_id": "downloader-1", "prefix": "", "lease_seconds": 120}
-```
-
-| 字段 | 说明 |
+| 主记录 | 键 → 值 |
 |---|---|
-| `client_id` | 必填，下载端标识 |
-| `prefix` | 可选，只认领该路径下的对象。按路径段匹配：`data` 命中 `data` 与 `data/…`，不命中 `database.txt` |
-| `lease_seconds` | 默认 120，上限 3600 |
+| `objects` | id → 对象版本（路径、大小、SHA-256、状态、投递次数、租约、元数据等） |
+| `namespace` | tenant\0path → id（上传方当前看到的版本） |
+| `uploads` | id → 上传会话 |
+| `claims` | lease → 认领单 |
+| `tombstones` | id → 删除原因与时间（用于幂等 commit） |
+| `gc` | id → 待删除的 blob |
+| `directories` | 显式创建的目录 |
 
-- 有对象：`201`，body 为认领单
-- 队列空：`204`
+| 索引 | 用途 |
+|---|---|
+| `queue` / `queue_seg` | 按全局顺序、按首段目录排列的投递队列（值里带可见时间和路径，按前缀过滤时不必解码对象） |
+| `lease_expiry` | 按到期时间排序的租约 |
+| `upload_paths` | 按路径查找可续传的上传 |
+| `stale` / `held` / `parked` / `tomb_times` | 按时间排序的待清理项与死信 |
 
-认领单字段：`lease_id`、`object_id`、`tenant`、`client_id`、`path`、`size`、`sha256`、`version`、`lease_until`。
+**目录 schema 版本为 2**。打开旧版本 catalog 时会自动迁移：按版本号重建队列；上一代两阶段删除遗留的 `DELETE_PENDING` 转成垃圾回收项。
 
-续租：`POST /v1/claims/{lease}/renew`，body 可选 `{"lease_seconds": 120}`。  
-放弃：`DELETE /v1/claims/{lease}`，对象回到可被他人认领。
-
-### 下载内容
-
-```http
-GET /v1/objects/{object_id}/content
-Authorization: Bearer <API Key>
-X-Xsync-Lease-ID: <lease_id>
-Range: bytes=0-1048575
-```
-
-响应带 `ETag`（`sha256:…`）和 `X-Content-SHA256`。支持 HTTP Range（完整命中为 `200`，部分为 `206`）。
-
-### 确认删除
-
-下载端在本地算完大小和 SHA-256 后提交：
-
-```http
-POST /v1/objects/{object_id}/commit
-Content-Type: application/json
-
-{"lease_id": "<lease_id>", "sha256": "<hex>", "size": 1234}
-```
-
-校验一致则删除该 object ID 对应的 blob，返回 `204`。大小或哈希不一致返回 `422`。对象已删后的重复 commit 仍返回 `204`（幂等）。
-
-语义是**至少一次投递**：租约过期会重新进入队列；下载端必须以 commit 的幂等结果为准，不能假设「拉到一次就一定从服务器消失」。
-
-## 6. 一致性与状态机
+## 4. 对象状态机
 
 ```text
-UPLOADING → FINALIZING → READY → LEASED → DELETE_PENDING → DELETED
-                ↘ INTERRUPTED（上传中断，可按路径续传）
-                ↘ FAILED（无法恢复，等待回收）
+UPLOADING → FINALIZING → READY ⇄ LEASED → （commit）删除，留墓碑
+                  │         ↑       │
+                  │       HELD      ├→ PARKED（死信）→ requeue → READY
+                  │  （临时名）      └→ 上传方删除/覆盖：撤回，释放或过期时删除
+                  ├→ INTERRUPTED（可续传）
+                  └→ FAILED（丢弃）
 ```
 
-1. 客户端写入 `staging/`，状态 `UPLOADING`
-2. 关闭成功：`fsync` → 计算 SHA-256 → 原子改名到 `objects/` → catalog 事务发布，进入 `READY` 队列
-3. 关闭失败或进程崩溃于上传中：`INTERRUPTED`
-4. 下载端 claim 后 `LEASED`，同时离开队列；放弃或过期退回 `READY` 并按原顺序回队
-5. commit 校验通过后 `DELETE_PENDING`，删 blob、写 tombstone
+- **发布**：上传方关闭文件后，服务端依次执行 fsync、计算 SHA-256、改名进 `objects/`、fsync 目录，最后提交事务。只有事务提交成功，`Close` 才向上传方确认成功；此前任一步失败都会返回错误，并把上传标为 FAILED。
+- **HELD**：文件名匹配临时名模式（默认 `*.filepart`、`*.partial`、`*.tmp`）时不投递，改名为正式名时才进入队列。WinSCP、rclone 等工具先写临时名再改名的流程因此不会把半成品交出去。超过 `partial_ttl` 仍未改名的临时文件会被清理。
+- **覆盖策略**：同一路径再次上传时，默认 `supersede`，也就是删除尚未投递的旧版本；正在投递的旧版本被撤回，commit 仍然成功，但释放或过期后直接删除。账号设为 `keep` 时，每个版本都会投递。
+- **重命名**：正在投递的对象不能改名（返回忙），避免下载端按旧名字落盘。POSIX 语义的改名（SFTP `posix-rename`、FTP `RNFR/RNTO`）可以覆盖同名文件，被覆盖的一方按覆盖策略处理。
+- **文件与目录互斥**：同一路径不能既是文件又是目录。S3 的目录占位键（以 `/` 结尾、内容为空）会变成目录，不会作为文件投递。
 
-`DELETED` 是概念终态：对象记录被删除，只留一条 tombstone 用于幂等 commit。
+## 5. 上传语义
 
-SHA-256 在顺序写入时随流计算，`finalize` 不再重读一遍文件；一旦出现乱序写入或 truncate，则退回完整重算，保证目录里的哈希始终等于盘上内容。
+`UploadHandle` 支持三种打开模式：
 
-启动恢复会：
+| 模式 | 来源 | 行为 |
+|---|---|---|
+| 截断 | SFTP 带 `O_TRUNC` 打开、FTP `STOR`、S3 `PUT` | 从空文件开始 |
+| 续传 | SFTP 不带 `O_TRUNC` 打开、FTP `REST`+`STOR` | 由**第一次写入的偏移**决定基底：偏移等于中断分片的大小，就原地续写；等于当前版本的大小，就克隆当前版本（Linux 上走 `copy_file_range`/reflink）；偏移为 0，就从空文件开始。SFTP 的写包可能乱序到达，先到的偏移对不上任何基底时，写入稀疏文件，关闭时再按最小偏移补齐前缀 |
+| 追加 | FTP `APPE`、SFTP `O_APPEND` | 追加到上传方当前看到的内容末尾，偏移按相对值换算 |
 
-- 把仍停在 `FINALIZING` 的上传做完（staging 还在则继续 finalize；blob 已改名则补发布）
-- 过期 `LEASED` 退回 `READY`
-- 未完成的 `DELETE_PENDING` 继续删
-- 把崩溃时仍为 `UPLOADING` 的记录标为 `INTERRUPTED`
+关闭时会检查**覆盖区间**：从 0 到文件末尾的每个字节，要么继承自基底，要么由客户端写入。有空洞的上传不会发布：连续的前缀保留为可续传分片，文件大小截到该前缀。
 
-**单条记录恢复失败不会阻止启动**：读不出的 blob 等不可恢复情况会被标为 `FAILED` 并记入日志，服务继续启动，其余对象照常可用。若恢复期间无法写入 catalog（数据库本身损坏），才会拒绝启动。
+`Stat`/`SIZE` 返回的大小与续传基底一致：如果存在比已发布版本更新的中断分片，报告分片的大小，客户端据此续传不会出错。
 
-后台维护循环（默认 30 秒）清理过期租约、超过 `partial_ttl`（默认 24 小时）的 `INTERRUPTED` / `FAILED` 记录及其残留 blob。扫描阶段只读，写入拆成逐条小事务，因此维护不会阻塞正在进行的上传。
+SHA-256 在写入时流式计算。SFTP 的写包乱序到达时，由最多 32 MiB 的重排缓冲吸收，关闭时不必把整个文件重读一遍。
+
+FTP 的流模式无法区分"传完了"和"连接断了"。服务端在数据连接结束后等待 `ftp.close_grace`（默认 200ms），如果控制连接在这段时间内断开，就按中断处理，不发布截断的文件。客户端也可以先发 `ALLO <size>` 声明大小，实收大小不一致时同样不发布。最可靠的做法是配合临时名规则使用。
+
+S3 multipart：每个分片单独保存元数据。Complete 不受客户端断开影响；拼装前先预留空间，全局最多 2 个拼装同时进行。完成记录会保留，客户端超时重试会得到同一个 ETag。
+
+## 6. 投递语义
+
+- **至少一次**：租约过期后对象会重新进入队列。下载端应以 commit 的幂等结果为准。
+- **认领**：先在只读事务里查找候选对象，再在写事务里复核并认领。队列为空时不产生写事务。支持一次认领多个对象，也支持长轮询：新对象发布时，正在等待的请求会被唤醒。
+- **失败处理**：释放或过期的对象回到**队尾**，可以设置不可见时间。投递次数达到上限，或下载端报告永久失败时，对象进入 **PARKED**（死信）：不再投递，但在指标和列表中可见，可以重新入队或删除。
+- **租约**：以 lease ID 防止旧持有者误提交。续租没有请求体时按原租约长度续期；已过期的租约不能再续。租约到期由索引驱动，每秒检查一次。
 
 ## 7. 容量保护
 
-默认水位（`config.Default()`）：
-
 | 水位 | 默认 | 行为 |
 |---|---|---|
-| 软 | 75% | 按下载/删除 EWMA 与 30 分钟剩余窗口自适应限速；按租户 `weight` 分配上传预算 |
-| 硬 | 90% | 拒绝新写入 |
-| 危 | 95% 或低于 `min_free_bytes`（默认 5 GiB） | 保护状态，`/readyz` 为 503 |
+| 软 | 75% | 按"删除速率（慢 EWMA）+ 剩余空间 / 30 分钟"计算全局上传预算，**进入软区立即生效**；预算只分给正在上传的账号（按权重分配，空闲账号的份额不会被预留） |
+| 硬 | 90% | 拒绝新上传；已在进行的上传继续 |
+| 危急 | 95%，或可用空间 ≤ `min_free_bytes` | 所有写入立即失败，`/readyz` 返回 503；无法测量磁盘时也按危急处理 |
 
-租户还可设 `max_concurrent`（默认 8）和 `max_upload_bps`（0 表示不额外限制）。限速按整笔写入计费：超过令牌桶容量的大块写入会被切分逐段等待，不会有尾部字节免费通过。
+其他保护：
 
-S3 multipart 的 `CompleteMultipartUpload` 需要把各分片拼成完整对象，期间分片与成品同时在盘上，因此会先按分片总大小做一次容量预算，放不下时直接拒绝而不是写到危水位。拼装字节在分片上传时已计过量，不再重复限速。
-
-上传长期快于下载时，任何单机系统最终都会写满。硬拒绝新写入是可靠性边界，不是故障。
+- **空间预留**：服务端复制（S3 拼装、续传时克隆当前版本）先预留空间，预留量计入已用空间，并发操作不会基于同一份空闲空间同时通过检查。
+- **并发槽位**：每个账号最多 `max_concurrent` 个上传，满了最多等 `upload_slot_wait`，超时返回忙，不会无限阻塞。
+- **配额**：账号可以设置 `max_stored_bytes`，超出后拒绝新上传。
+- **磁盘压力下的清理**：硬水位时，中断的上传只保留 1 小时。
+- **空间不足时仍可启动**：启动时空间低于 `min_free_bytes` 不会拒绝启动，而是只允许下载，让积压可以排空。
 
 ## 8. 安全模型
 
-- 对外 HTTPS / FTPS / S3 使用同一套 TLS 证书；`init` 签发 **ECDSA P-256** 证书（IP SAN = advertise-ip），最低 TLS 1.2。SSH host key 仍为 **Ed25519**。
-- FTP 默认强制 TLS；明文 FTP 必须按租户打开。
-- 主配置通常只有 `data_dir`、`public_host`、`accounts_file`，不含账号秘密。
-- 账号库 `accounts.yaml` 与连接包权限 `0600`，由 `init` / `account add` 维护，不需手工改密钥。
-- 下载 API 用 API Key 的 SHA-256 做常时间比较；SFTP/FTP 密码同样常时间比较。
-- 认证后的租户身份只在请求 context 内传递，不经由请求头，客户端无法伪造。
-- 下载 API 每个请求记一条访问日志（方法、路径、状态码、字节数、租户、来源地址、耗时），`/healthz` 与 `/readyz` 降到 debug 级以免刷屏。
-- 生产镜像：UID/GID `65532`、只读根文件系统、drop 全部 Linux capabilities、两个 bind 卷（配置盘与数据盘）。
-- 生产要求 `data_dir` 为独立挂载点，避免暂存写到系统盘。
+- **传输**：对外 HTTPS、FTPS、S3 共用一张服务证书，由长期 CA（10 年）签发，有效期 397 天。连接包信任的是 CA，续期服务证书（`cert renew`）不需要更换连接包；服务证书热加载。SSH host key 使用 Ed25519。
+- **凭证**：
+  - 下载 API Key 只存 SHA-256；
+  - SFTP/FTP 密码只存加盐哈希（都是 160 位随机密钥，不需要慢哈希，认证本身也就不会成为 CPU 放大点）；
+  - S3 secret 因为 SigV4 需要明文，用 `secrets.key`（AES-256-GCM）加密存放。这个密钥应与配置备份分开保存，例如作为 Docker secret。
+- **账号生命周期**：支持 add / update / disable / enable / remove / rotate。改动在 5 秒内生效（也可以发 SIGHUP 或调用管理接口立即生效），不需要重启。
+- **S3 前置守卫**：只接受 SigV4 签名的请求；拒绝浏览器表单 POST、服务端复制（`X-Amz-Copy-Source`）以及白名单之外的子资源；调用方只能访问自己的 bucket；非对象请求体上限为 `limits.max_request_body`。后端在读写时还会再次校验调用方所属租户。
+- **防滥用**：
+  - 全局和单 IP 连接数上限；
+  - SFTP 握手超时；
+  - 空闲与停滞超时：只有连接停止传输数据才会断开，不限制大文件的总传输时长；
+  - 按来源 IP 限制认证失败次数，SFTP、FTP、S3、下载 API 都受限；
+  - SFTP 单会话打开文件数上限。
+- **信息暴露**：`/readyz` 只返回结论；API 的 500 响应不带内部细节；匿名请求无法判断 bucket 是否存在。
+- **运维接口**：`/admin/*` 需要 `admin.token`，默认只监听本机回环地址。
 
-## 9. 命令与账号
+## 9. 可靠性
 
-```text
-xsync-server init             --config --data-dir --advertise-ip [--require-mount=false] [--force]
-xsync-server account add      --config --id [--s3-bucket] [--weight] [--max-concurrent]
-                              [--max-upload-bps] [--allow-plain-ftp] [--client-config]
-xsync-server validate-config  --config
-xsync-server serve            --config
-xsync-server healthcheck      [--url http://127.0.0.1:9090/metrics]
-xsync-server version
-```
+- **崩溃恢复**：`UPLOADING` 变为 `INTERRUPTED`；`FINALIZING` 继续完成发布，无法恢复的标为 `FAILED`；残留的 blob 由垃圾回收清理。单条记录出错不会阻止启动。
+- **两阶段关闭**：收到 SIGTERM 后先停止接收新连接和新上传，进行中的传输有 `shutdown_grace`（默认 40 秒）来完成；超时后中断剩余传输，打开的上传保存为可续传分片，然后关闭 Store。
+- **维护**：所有例行清理都按索引进行，开销与待办量成正比。每秒处理一次租约到期和垃圾回收，每 30 秒清理过期分片、临时文件和墓碑，每小时对账一次：删除 catalog 不认识、且早于 `partial_ttl` 的孤儿文件。
+- **数据卷标记**：`init` 在数据盘上写入 `.xsync-volume`，启动时核对。数据卷没有挂载时（容器里的空目录）拒绝启动，不会把数据写到系统盘。
+- **离线工具**：`catalog check` 检查索引与 blob 的一致性，`catalog repair` 重建索引并清理孤儿文件。
 
-`init` 不创建账号。`account add` 在文件锁下原子写入账号库并生成连接包；**新账号需重启 `serve` 才生效**。
+## 10. 可观测性
 
-本地开发可 `--require-mount=false`。生产 Docker 流程以 README 为准。
+`/metrics`（Prometheus 文本格式，带 HELP/TYPE）包括：
 
-## 10. 当前范围
+- 磁盘：总量、可用、预留、使用率；上传、下载、删除速率；上传预算（`+Inf` 表示不限速）；限速、拒绝、危急三个标志；statfs 错误次数；
+- 目录：各状态的对象数、存量字节、上传会话数、正在进行的上传数、待回收数、暂存区字节；
+- 按账号：就绪、租出、死信、暂存的对象数，存量字节，**最老就绪对象的等待时长**，上传速率，占用的槽位，因槽位已满被拒绝的次数；
+- 下载 API：按路由和状态码统计的请求数、延迟直方图、按账号统计的下载字节数，commit 和 release 次数（按类型）；
+- 安全：认证失败次数、被限流的次数；各协议的连接数；
+- 其他：证书到期时间、构建信息、是否正在关闭。
 
-- 单机，不是集群，没有跨节点复制或故障转移。
-- S3 只覆盖核心对象路径；完整 AWS 兼容性不是目标。
-- 连接包里的 `public_host` 必须是客户端能访问的 IP（同时用于证书 SAN 和 FTP 被动模式地址）。
-- 指标中无上传限速时，`xsync_upload_limit_bytes_per_second` 可能显示为极大浮点数，属展示问题。
+## 11. 当前边界与演进方向
 
-## 11. 下载端最小流程
-
-```text
-循环:
-  POST /v1/claims          → 204 则空闲退出或退避
-  GET  /v1/objects/{id}/content   (X-Xsync-Lease-ID)
-  本地计算 size 与 sha256
-  与认领单核对
-  POST /v1/objects/{id}/commit
-```
-
-大文件应续租（`/v1/claims/{lease}/renew`）。需要断点续传时用 `Range`。哈希不一致不要 commit，可释放租约让对象重新入队。
+- 单机部署，没有跨节点复制或故障转移。如果需要高可用，建议的路线是：先用块存储快照加冷备机，满足 RPO/RTO；再把 catalog 抽象（`Store` 的读写已经集中在事务函数里）替换为支持复制的后端。
+- S3 只覆盖中转需要的核心对象操作。`go-faster/fs` 仍标注为开发/测试用途，它的授权语义已经被前置守卫收紧；换用其他 S3 前端时，只需保留守卫与后端接口。
+- 多消费组（同一对象投递给多个下游）尚未实现。现有的租约与墓碑模型可以扩展为按消费组维护队列。

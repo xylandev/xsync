@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -13,196 +14,395 @@ import (
 	"golang.org/x/time/rate"
 )
 
-var ErrCriticalCapacity = errors.New("critical storage capacity reached")
+var (
+	ErrCriticalCapacity = errors.New("critical storage capacity reached")
+	ErrUploadsRejected  = errors.New("storage is above the hard watermark; new uploads are rejected")
+	ErrTooManyUploads   = errors.New("too many concurrent uploads for this account")
+)
+
+// StatFS reports the total and available bytes of the filesystem holding path.
+type StatFS func(path string) (total, avail uint64, err error)
+
+func osStatFS(path string) (uint64, uint64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, 0, err
+	}
+	return uint64(st.Blocks) * uint64(st.Bsize), uint64(st.Bavail) * uint64(st.Bsize), nil
+}
 
 type Snapshot struct {
 	TotalBytes     uint64
 	AvailableBytes uint64
+	ReservedBytes  uint64
 	UsedPercent    float64
 	UploadBPS      float64
 	DownloadBPS    float64
 	DeleteBPS      float64
+	// UploadLimitBPS is the global upload budget; +Inf means unthrottled.
 	UploadLimitBPS float64
+	Throttled      bool
 	RejectNew      bool
 	Critical       bool
+	StatErrors     uint64
 	MeasuredAt     time.Time
+	Tenants        map[string]TenantSnapshot
+}
+
+type TenantSnapshot struct {
+	UploadBPS      float64
+	UploadLimitBPS float64
+	ActiveUploads  int
+	SlotRejections uint64
+}
+
+type tenantState struct {
+	limiter    *rate.Limiter
+	weight     int
+	max        int64
+	sem        chan struct{}
+	lastActive atomic.Int64
+	bytes      atomic.Uint64
+	lastBytes  uint64
+	ewma       float64
+	rejected   atomic.Uint64
 }
 
 type Controller struct {
-	root    string
-	cfg     config.CapacityConfig
-	limiter *rate.Limiter
+	root   string
+	cfg    config.CapacityConfig
+	statfs StatFS
+	now    func() time.Time
+	global *rate.Limiter
 
-	mu          sync.RWMutex
-	snapshot    Snapshot
-	tenants     map[string]*rate.Limiter
-	weights     map[string]int
-	tenantMax   map[string]int64
-	semaphores  map[string]chan struct{}
-	totalWeight int
+	mu       sync.RWMutex
+	snapshot Snapshot
+	tenants  map[string]*tenantState
 
-	uploaded       atomic.Uint64
-	downloaded     atomic.Uint64
-	deleted        atomic.Uint64
-	lastUploaded   uint64
-	lastDownloaded uint64
-	lastDeleted    uint64
-	ewmaUpload     float64
-	ewmaDownload   float64
-	ewmaDelete     float64
+	reserved   atomic.Int64
+	statErrors atomic.Uint64
+
+	uploaded, downloaded, deleted         atomic.Uint64
+	lastUploaded, lastDownloaded, lastDel uint64
+	ewmaUpload, ewmaDownload, ewmaDelete  float64
+	drainEstimate                         float64
+	sampledOnce                           bool
+	activityWindow                        time.Duration
+	burst                                 int
 }
 
+const burst = 4 << 20
+
 func New(root string, cfg config.CapacityConfig, tenants []config.Tenant) *Controller {
-	max := rate.Inf
-	burst := 4 << 20
+	return NewWithStatFS(root, cfg, tenants, osStatFS, time.Now)
+}
+
+// NewWithStatFS builds a controller with injectable filesystem and clock, so the
+// control loop can be tested without filling a real disk.
+func NewWithStatFS(root string, cfg config.CapacityConfig, tenants []config.Tenant, statfs StatFS, now func() time.Time) *Controller {
+	limit := rate.Inf
 	if cfg.MaxUploadBPS > 0 {
-		max = rate.Limit(cfg.MaxUploadBPS)
+		limit = rate.Limit(cfg.MaxUploadBPS)
 	}
-	c := &Controller{root: root, cfg: cfg, limiter: rate.NewLimiter(max, burst), tenants: map[string]*rate.Limiter{}, weights: map[string]int{}, tenantMax: map[string]int64{}, semaphores: map[string]chan struct{}{}}
-	for _, t := range tenants {
-		limit := rate.Inf
-		if t.MaxUploadBPS > 0 {
-			limit = rate.Limit(t.MaxUploadBPS)
-		}
-		c.tenants[t.ID] = rate.NewLimiter(limit, burst)
+	c := &Controller{root: root, cfg: cfg, statfs: statfs, now: now, global: rate.NewLimiter(limit, burst), tenants: map[string]*tenantState{}, activityWindow: 10 * time.Second, burst: burst}
+	c.SyncTenants(tenants)
+	return c
+}
+
+// SyncTenants applies an account list: new accounts get limiters, changed
+// limits take effect, and removed accounts lose their state. Uploads holding a
+// slot keep a reference to the old semaphore and release into it.
+func (c *Controller) SyncTenants(list []config.Tenant) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	seen := map[string]bool{}
+	for _, t := range list {
+		seen[t.ID] = true
 		w := t.Weight
 		if w <= 0 {
 			w = 1
 		}
-		c.weights[t.ID] = w
-		c.totalWeight += w
-		c.tenantMax[t.ID] = t.MaxUploadBPS
 		maxConcurrent := t.MaxConcurrent
 		if maxConcurrent <= 0 {
 			maxConcurrent = 8
 		}
-		c.semaphores[t.ID] = make(chan struct{}, maxConcurrent)
+		st := c.tenants[t.ID]
+		if st == nil {
+			st = &tenantState{limiter: rate.NewLimiter(rate.Inf, burst)}
+			c.tenants[t.ID] = st
+		}
+		st.weight, st.max = w, t.MaxUploadBPS
+		if st.max > 0 && st.limiter.Limit() == rate.Inf {
+			st.limiter.SetLimit(rate.Limit(st.max))
+		}
+		if st.sem == nil || cap(st.sem) != maxConcurrent {
+			st.sem = make(chan struct{}, maxConcurrent)
+		}
 	}
-	return c
+	for id := range c.tenants {
+		if !seen[id] {
+			delete(c.tenants, id)
+		}
+	}
 }
 
 func (c *Controller) Run(ctx context.Context) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
-	c.sample()
+	c.Sample()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			c.sample()
+			c.Sample()
 		}
 	}
 }
 
-func (c *Controller) sample() {
-	var st syscall.Statfs_t
-	if syscall.Statfs(c.root, &st) != nil {
+func isInf(l rate.Limit) bool { return l == rate.Inf || math.IsInf(float64(l), 1) }
+
+func (c *Controller) reserveFloor(total uint64) uint64 {
+	floor := c.cfg.MinFreeBytes
+	if criticalFree := uint64(float64(total) * (100 - c.cfg.CriticalPercent) / 100); criticalFree > floor {
+		floor = criticalFree
+	}
+	return floor
+}
+
+// Sample takes one measurement and retunes the limiters. Run calls it every
+// second; tests call it directly.
+func (c *Controller) Sample() {
+	total, avail, err := c.statfs(c.root)
+	if err != nil {
+		c.statErrors.Add(1)
+		c.mu.Lock()
+		// Without a measurement the safe assumption is that the disk is
+		// critical: refusing uploads is recoverable, filling the disk is not.
+		c.snapshot.Critical, c.snapshot.RejectNew = true, true
+		c.snapshot.StatErrors = c.statErrors.Load()
+		c.mu.Unlock()
 		return
 	}
-	total := uint64(st.Blocks) * uint64(st.Bsize)
-	avail := uint64(st.Bavail) * uint64(st.Bsize)
+	reserved := uint64(max(c.reserved.Load(), 0))
+	effAvail := uint64(0)
+	if avail > reserved {
+		effAvail = avail - reserved
+	}
 	usedPct := 0.0
 	if total > 0 {
-		usedPct = 100 * float64(total-avail) / float64(total)
+		usedPct = 100 * float64(total-min(effAvail, total)) / float64(total)
 	}
 	u, d, del := c.uploaded.Load(), c.downloaded.Load(), c.deleted.Load()
-	instantU, instantD, instantDel := float64(u-c.lastUploaded), float64(d-c.lastDownloaded), float64(del-c.lastDeleted)
-	c.lastUploaded, c.lastDownloaded, c.lastDeleted = u, d, del
-	const alpha = 0.18
-	c.ewmaUpload += alpha * (instantU - c.ewmaUpload)
-	c.ewmaDownload += alpha * (instantD - c.ewmaDownload)
-	c.ewmaDelete += alpha * (instantDel - c.ewmaDelete)
+	instantU, instantD, instantDel := float64(u-c.lastUploaded), float64(d-c.lastDownloaded), float64(del-c.lastDel)
+	c.lastUploaded, c.lastDownloaded, c.lastDel = u, d, del
+	// A short time constant for the rates shown in metrics, and a long one for
+	// the drain estimate: deletions arrive in bursts (one whole file per
+	// commit), and a budget that followed each burst would oscillate.
+	const fast, slow = 0.3, 0.05
+	if !c.sampledOnce {
+		c.ewmaUpload, c.ewmaDownload, c.ewmaDelete, c.drainEstimate = instantU, instantD, instantDel, instantDel
+		c.sampledOnce = true
+	} else {
+		c.ewmaUpload += fast * (instantU - c.ewmaUpload)
+		c.ewmaDownload += fast * (instantD - c.ewmaDownload)
+		c.ewmaDelete += fast * (instantDel - c.ewmaDelete)
+		c.drainEstimate += slow * (instantDel - c.drainEstimate)
+	}
 
 	desired := math.Inf(1)
 	if c.cfg.MaxUploadBPS > 0 {
 		desired = float64(c.cfg.MaxUploadBPS)
 	}
+	throttled := false
 	if usedPct >= c.cfg.SoftPercent {
-		reserve := c.cfg.MinFreeBytes
-		criticalFree := uint64(float64(total) * (100 - c.cfg.CriticalPercent) / 100)
-		if criticalFree > reserve {
-			reserve = criticalFree
+		floor := c.reserveFloor(total)
+		spare := 0.0
+		if effAvail > floor {
+			spare = float64(effAvail - floor)
 		}
-		spare := float64(0)
-		if avail > reserve {
-			spare = float64(avail - reserve)
-		}
-		drain := math.Max(c.ewmaDownload, c.ewmaDelete)
-		budget := drain + spare/c.cfg.TargetRunway.Seconds()
-		if desired > budget {
+		// Only deletions free space; downloads that are not committed yet
+		// do not, so they are not part of the drain estimate.
+		budget := c.drainEstimate + spare/c.cfg.TargetRunway.Seconds()
+		if budget < desired {
 			desired = budget
+			throttled = true
 		}
 	}
-	if usedPct >= c.cfg.CriticalPercent || avail <= c.cfg.MinFreeBytes {
-		desired = 1
+	critical := usedPct >= c.cfg.CriticalPercent || effAvail <= c.cfg.MinFreeBytes
+	if critical {
+		desired, throttled = 0, true
 	}
-	current := float64(c.limiter.Limit())
-	if math.IsInf(current, 1) {
-		current = desired
+
+	current := c.global.Limit()
+	switch {
+	case math.IsInf(desired, 1):
+		c.global.SetLimit(rate.Inf)
+	case isInf(current) || desired < float64(current):
+		// Cut immediately: the budget exists to protect the disk.
+		c.global.SetLimit(rate.Limit(math.Max(desired, 1)))
+	default:
+		// Recover gradually so a single burst of deletions does not open
+		// the floodgates.
+		c.global.SetLimit(rate.Limit(math.Max(1, math.Min(desired, float64(current)*1.25+float64(burst)))))
 	}
-	if !math.IsInf(desired, 1) {
-		low, high := current*0.9, current*1.1
-		if current <= 1 {
-			low, high = 1, math.Max(1, desired)
-		}
-		desired = math.Max(low, math.Min(high, desired))
-		c.limiter.SetLimit(rate.Limit(math.Max(1, desired)))
-	} else if c.cfg.MaxUploadBPS <= 0 && usedPct < c.cfg.SoftPercent {
-		c.limiter.SetLimit(rate.Inf)
-	}
+	globalLimit := c.global.Limit()
+
+	now := c.now()
 	c.mu.Lock()
-	for id, lim := range c.tenants {
-		tenantDesired := math.Inf(1)
-		if usedPct >= c.cfg.SoftPercent && c.totalWeight > 0 && !math.IsInf(desired, 1) {
-			tenantDesired = desired * float64(c.weights[id]) / float64(c.totalWeight)
-		}
-		if max := c.tenantMax[id]; max > 0 && (math.IsInf(tenantDesired, 1) || tenantDesired > float64(max)) {
-			tenantDesired = float64(max)
-		}
-		if math.IsInf(tenantDesired, 1) {
-			lim.SetLimit(rate.Inf)
-		} else {
-			lim.SetLimit(rate.Limit(math.Max(1, tenantDesired)))
+	activeWeight := 0
+	for _, st := range c.tenants {
+		if now.Sub(time.Unix(0, st.lastActive.Load())) < c.activityWindow || len(st.sem) > 0 {
+			activeWeight += st.weight
 		}
 	}
-	c.snapshot = Snapshot{TotalBytes: total, AvailableBytes: avail, UsedPercent: usedPct, UploadBPS: c.ewmaUpload, DownloadBPS: c.ewmaDownload, DeleteBPS: c.ewmaDelete, UploadLimitBPS: float64(c.limiter.Limit()), RejectNew: usedPct >= c.cfg.HardPercent, Critical: usedPct >= c.cfg.CriticalPercent || avail <= c.cfg.MinFreeBytes, MeasuredAt: time.Now().UTC()}
+	tenants := make(map[string]TenantSnapshot, len(c.tenants))
+	for id, st := range c.tenants {
+		b := st.bytes.Load()
+		inst := float64(b - st.lastBytes)
+		st.lastBytes = b
+		st.ewma += fast * (inst - st.ewma)
+		share := math.Inf(1)
+		if !isInf(globalLimit) {
+			// Work-conserving split: the budget is divided among accounts
+			// that are actually uploading, so a lone active account is not
+			// held to a share reserved for idle ones. An idle account is
+			// sized as if it had just become active.
+			weightPool := activeWeight
+			if now.Sub(time.Unix(0, st.lastActive.Load())) >= c.activityWindow && len(st.sem) == 0 {
+				weightPool += st.weight
+			}
+			if weightPool == 0 {
+				weightPool = st.weight
+			}
+			share = float64(globalLimit) * float64(st.weight) / float64(weightPool)
+		}
+		if st.max > 0 && share > float64(st.max) {
+			share = float64(st.max)
+		}
+		if math.IsInf(share, 1) {
+			st.limiter.SetLimit(rate.Inf)
+		} else {
+			st.limiter.SetLimit(rate.Limit(math.Max(1, share)))
+		}
+		tenants[id] = TenantSnapshot{UploadBPS: st.ewma, UploadLimitBPS: share, ActiveUploads: len(st.sem), SlotRejections: st.rejected.Load()}
+	}
+	limitBPS := math.Inf(1)
+	if !isInf(globalLimit) {
+		limitBPS = float64(globalLimit)
+	}
+	c.snapshot = Snapshot{
+		TotalBytes: total, AvailableBytes: avail, ReservedBytes: reserved, UsedPercent: usedPct,
+		UploadBPS: c.ewmaUpload, DownloadBPS: c.ewmaDownload, DeleteBPS: c.ewmaDelete,
+		UploadLimitBPS: limitBPS, Throttled: throttled,
+		RejectNew: usedPct >= c.cfg.HardPercent || critical, Critical: critical,
+		StatErrors: c.statErrors.Load(), MeasuredAt: now.UTC(), Tenants: tenants,
+	}
 	c.mu.Unlock()
 }
 
-func (c *Controller) Snapshot() Snapshot   { c.mu.RLock(); defer c.mu.RUnlock(); return c.snapshot }
-func (c *Controller) AllowNewUpload() bool { s := c.Snapshot(); return !s.RejectNew && !s.Critical }
-
-// AllowBytes reports whether n more bytes fit before the critical watermark.
-// Callers that transiently need a second copy of an object on disk must budget
-// for it up front, because the watermarks alone only gate *new* uploads.
-func (c *Controller) AllowBytes(n int64) bool {
-	s := c.Snapshot()
-	if s.RejectNew || s.Critical {
-		return false
-	}
-	if n <= 0 || s.TotalBytes == 0 {
-		// TotalBytes is zero only before the first sample; do not reject then.
-		return true
-	}
-	reserve := c.cfg.MinFreeBytes
-	if criticalFree := uint64(float64(s.TotalBytes) * (100 - c.cfg.CriticalPercent) / 100); criticalFree > reserve {
-		reserve = criticalFree
-	}
-	return s.AvailableBytes > reserve && s.AvailableBytes-reserve >= uint64(n)
+func (c *Controller) Snapshot() Snapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	s := c.snapshot
+	return s
 }
 
-func (c *Controller) AcquireUpload(ctx context.Context, tenant string) (func(), error) {
+// AdmitUpload reports whether a new upload may start given the watermarks.
+func (c *Controller) AdmitUpload() error {
+	s := c.Snapshot()
+	switch {
+	case s.Critical:
+		return ErrCriticalCapacity
+	case s.RejectNew:
+		return ErrUploadsRejected
+	}
+	return nil
+}
+
+// AllowNewUpload is AdmitUpload as a boolean.
+func (c *Controller) AllowNewUpload() bool { return c.AdmitUpload() == nil }
+
+// CheckCritical returns ErrCriticalCapacity while the disk is critical. Writes
+// that are not rate limited (server-side copies) call it periodically.
+func (c *Controller) CheckCritical() error {
+	if c.Snapshot().Critical {
+		return ErrCriticalCapacity
+	}
+	return nil
+}
+
+// Reserve claims n bytes of headroom above the critical floor for a server-side
+// write whose size is known up front, such as a multipart assembly. Reserved
+// bytes count as used until release is called, so concurrent reservations
+// cannot all pass against the same free space.
+func (c *Controller) Reserve(n int64) (func(), bool) {
+	if n <= 0 {
+		return func() {}, true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.snapshot
+	if s.Critical || s.RejectNew {
+		return nil, false
+	}
+	if s.TotalBytes > 0 {
+		reserved := uint64(max(c.reserved.Load(), 0))
+		floor := c.reserveFloor(s.TotalBytes)
+		if s.AvailableBytes < reserved+floor || s.AvailableBytes-reserved-floor < uint64(n) {
+			return nil, false
+		}
+	}
+	c.reserved.Add(n)
+	var once sync.Once
+	return func() { once.Do(func() { c.reserved.Add(-n) }) }, true
+}
+
+// AllowBytes reports whether n more bytes fit before the critical watermark.
+func (c *Controller) AllowBytes(n int64) bool {
+	release, ok := c.Reserve(n)
+	if ok {
+		release()
+	}
+	return ok
+}
+
+func (c *Controller) tenant(id string) *tenantState {
 	c.mu.RLock()
-	sem := c.semaphores[tenant]
-	c.mu.RUnlock()
-	if sem == nil {
+	defer c.mu.RUnlock()
+	return c.tenants[id]
+}
+
+// AcquireUpload takes one of the tenant's concurrent-upload slots. It waits at
+// most upload_slot_wait; blocking indefinitely would park protocol workers
+// (SFTP processes opens sequentially per session) and deadlock the session.
+func (c *Controller) AcquireUpload(ctx context.Context, tenant string) (func(), error) {
+	st := c.tenant(tenant)
+	if st == nil {
 		return func() {}, nil
+	}
+	sem := st.sem
+	release := func() func() {
+		var once sync.Once
+		return func() { once.Do(func() { <-sem }) }
 	}
 	select {
 	case sem <- struct{}{}:
-		var once sync.Once
-		return func() { once.Do(func() { <-sem }) }, nil
+		return release(), nil
+	default:
+	}
+	if c.cfg.UploadSlotWait <= 0 {
+		st.rejected.Add(1)
+		return nil, ErrTooManyUploads
+	}
+	timer := time.NewTimer(c.cfg.UploadSlotWait)
+	defer timer.Stop()
+	select {
+	case sem <- struct{}{}:
+		return release(), nil
+	case <-timer.C:
+		st.rejected.Add(1)
+		return nil, ErrTooManyUploads
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -215,28 +415,22 @@ func (c *Controller) WaitN(ctx context.Context, tenant string, n int) error {
 	if c.Snapshot().Critical {
 		return ErrCriticalCapacity
 	}
-	c.mu.RLock()
-	tl := c.tenants[tenant]
-	c.mu.RUnlock()
+	st := c.tenant(tenant)
 	// A single reservation cannot exceed the limiter's burst, so consume the
 	// request in burst-sized chunks. Truncating instead would let the tail of a
 	// large write bypass both the rate limit and the throughput accounting.
-	chunk := c.limiter.Burst()
-	if tl != nil && tl.Burst() < chunk {
-		chunk = tl.Burst()
-	}
-	if chunk <= 0 {
-		chunk = n
-	}
+	chunk := c.burst
 	for remaining := n; remaining > 0; {
 		take := min(remaining, chunk)
-		if err := c.limiter.WaitN(ctx, take); err != nil {
+		if err := c.global.WaitN(ctx, take); err != nil {
 			return err
 		}
-		if tl != nil {
-			if err := tl.WaitN(ctx, take); err != nil {
+		if st != nil {
+			if err := st.limiter.WaitN(ctx, take); err != nil {
 				return err
 			}
+			st.bytes.Add(uint64(take))
+			st.lastActive.Store(c.now().UnixNano())
 		}
 		c.uploaded.Add(uint64(take))
 		remaining -= take
@@ -249,8 +443,21 @@ func (c *Controller) ObserveDownload(n int64) {
 		c.downloaded.Add(uint64(n))
 	}
 }
+
 func (c *Controller) ObserveDelete(n int64) {
 	if n > 0 {
 		c.deleted.Add(uint64(n))
 	}
+}
+
+// TenantIDs returns the tenants the controller tracks, sorted.
+func (c *Controller) TenantIDs() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]string, 0, len(c.tenants))
+	for id := range c.tenants {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
